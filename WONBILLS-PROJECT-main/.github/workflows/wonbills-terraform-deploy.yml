@@ -1,0 +1,98 @@
+
+name: WONBILLS Docker Deployment
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Prepare deployment package
+        run: |
+          mkdir -p deploy/frontend deploy/backend
+
+          cp -r WONBILLS-PROJECT-main/wonbills-frontend/. \
+            deploy/frontend/
+
+          cp -r WONBILLS-PROJECT-main/wonbills-backend/. \
+            deploy/backend/
+
+          tar -czf wonbills-deploy.tar.gz deploy
+
+      - name: Configure SSH
+        env:
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$EC2_SSH_KEY" > ~/.ssh/ec2_key
+          chmod 600 ~/.ssh/ec2_key
+          ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts
+
+      - name: Copy deployment package to EC2
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USERNAME: ${{ secrets.EC2_USERNAME }}
+        run: |
+          scp -i ~/.ssh/ec2_key \
+            wonbills-deploy.tar.gz \
+            "$EC2_USERNAME@$EC2_HOST:/tmp/wonbills-deploy.tar.gz"
+
+      - name: Build and deploy Docker containers
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USERNAME: ${{ secrets.EC2_USERNAME }}
+        run: |
+          ssh -i ~/.ssh/ec2_key \
+            "$EC2_USERNAME@$EC2_HOST" 'bash -s' <<'REMOTE'
+          set -e
+
+          mkdir -p /home/ubuntu/wonbills-deploy
+          tar -xzf /tmp/wonbills-deploy.tar.gz \
+            -C /home/ubuntu/wonbills-deploy
+
+          cd /home/ubuntu/wonbills-deploy/deploy
+
+          # Build backend image
+          sudo docker build \
+            -t wonbills-backend:latest \
+            ./backend
+
+          # Build frontend image
+          sudo docker build \
+            -t wonbills-frontend:latest \
+            ./frontend
+
+          # Replace backend container
+          sudo docker rm -f wonbills-backend || true
+
+          sudo docker run -d \
+            --name wonbills-backend \
+            --restart unless-stopped \
+            --env-file /home/ubuntu/wonbills/.env \
+            -p 8014:8014 \
+            wonbills-backend:latest
+
+          # Replace frontend container
+          sudo docker rm -f wonbills-frontend || true
+
+          sudo docker run -d \
+            --name wonbills-frontend \
+            --restart unless-stopped \
+            -p 5173:5173 \
+            -e VITE_API_URL="http://$(curl -s https://api.ipify.org):8014" \
+            wonbills-frontend:latest
+
+          sudo docker ps
+          REMOTE
